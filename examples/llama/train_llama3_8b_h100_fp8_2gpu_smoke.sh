@@ -5,7 +5,12 @@ set -euo pipefail
 # It keeps the 8B model shape, but uses TP=2, mock data, a short sequence
 # length, and only a few iterations so the example can validate the stack.
 
-export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
+USE_MEGATRON_FSDP=${USE_MEGATRON_FSDP:-0}
+if [[ "$USE_MEGATRON_FSDP" == "1" ]]; then
+    unset CUDA_DEVICE_MAX_CONNECTIONS
+else
+    export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
+fi
 export TORCH_COMPILE_DISABLE=${TORCH_COMPILE_DISABLE:-1}
 
 # Triton/Inductor sometimes needs the unversioned libcuda.so linker name.
@@ -60,6 +65,8 @@ NUM_QUERY_GROUPS=${NUM_QUERY_GROUPS:-8}
 KV_CHANNELS=${KV_CHANNELS:-128}
 VOCAB_SIZE=${VOCAB_SIZE:-128256}
 SAVE_CHECKPOINTS=${SAVE_CHECKPOINTS:-0}
+CKPT_FORMAT=${CKPT_FORMAT:-torch_dist}
+DATA_PARALLEL_SHARDING_STRATEGY=${DATA_PARALLEL_SHARDING_STRATEGY:-optim_grads_params}
 EXIT_DURATION_IN_MINS=${EXIT_DURATION_IN_MINS:-}
 WANDB_PROJECT=${WANDB_PROJECT:-}
 WANDB_EXP_NAME=${WANDB_EXP_NAME:-}
@@ -150,6 +157,14 @@ TRAINING_ARGS=(
     --overlap-param-gather
 )
 
+if [[ "$USE_MEGATRON_FSDP" == "1" ]]; then
+    CKPT_FORMAT=fsdp_dtensor
+    TRAINING_ARGS+=(
+        --use-megatron-fsdp
+        --data-parallel-sharding-strategy "$DATA_PARALLEL_SHARDING_STRATEGY"
+    )
+fi
+
 if [[ -n "$EXIT_DURATION_IN_MINS" ]]; then
     TRAINING_ARGS+=(--exit-duration-in-mins "$EXIT_DURATION_IN_MINS")
 fi
@@ -200,7 +215,7 @@ EVAL_AND_LOGGING_ARGS=(
     --eval-iters 0
     --eval-interval 1000
     --log-throughput
-    --ckpt-format torch_dist
+    --ckpt-format "$CKPT_FORMAT"
     --distributed-timeout-minutes 60
     --tensorboard-dir "$TENSORBOARD_LOGS_PATH"
 )
@@ -237,7 +252,7 @@ if [ ! -f "$PRETRAIN_SCRIPT_PATH" ]; then
     exit 1
 fi
 
-echo "Running Llama-3 FP8 smoke test on ${GPUS_PER_NODE} GPUs: layers=${NUM_LAYERS}, hidden=${HIDDEN_SIZE}, ffn=${FFN_HIDDEN_SIZE}, heads=${NUM_ATTENTION_HEADS}, query_groups=${NUM_QUERY_GROUPS}, TP=${TP_SIZE}, CP=${CP_SIZE}, PP=${PP_SIZE}, seq=${SEQ_LENGTH}, iters=${TRAIN_ITERS}, exit_mins=${EXIT_DURATION_IN_MINS:-none}, lr_decay_iters=${LR_DECAY_ITERS}, lr_warmup_iters=${LR_WARMUP_ITERS}, attn_res=${ATTENTION_RESIDUALS}, attn_res_type=${ATTENTION_RESIDUAL_TYPE}, attn_res_blocks=${ATTENTION_RESIDUAL_NUM_BLOCKS}, attn_res_impl=${ATTENTION_RESIDUAL_IMPLEMENTATION}, wandb_project=${WANDB_PROJECT:-none}"
+echo "Running Llama-3 FP8 smoke test on ${GPUS_PER_NODE} GPUs: layers=${NUM_LAYERS}, hidden=${HIDDEN_SIZE}, ffn=${FFN_HIDDEN_SIZE}, heads=${NUM_ATTENTION_HEADS}, query_groups=${NUM_QUERY_GROUPS}, TP=${TP_SIZE}, CP=${CP_SIZE}, PP=${PP_SIZE}, seq=${SEQ_LENGTH}, iters=${TRAIN_ITERS}, exit_mins=${EXIT_DURATION_IN_MINS:-none}, lr_decay_iters=${LR_DECAY_ITERS}, lr_warmup_iters=${LR_WARMUP_ITERS}, attn_res=${ATTENTION_RESIDUALS}, attn_res_type=${ATTENTION_RESIDUAL_TYPE}, attn_res_blocks=${ATTENTION_RESIDUAL_NUM_BLOCKS}, attn_res_impl=${ATTENTION_RESIDUAL_IMPLEMENTATION}, fsdp=${USE_MEGATRON_FSDP}, fsdp_sharding=${DATA_PARALLEL_SHARDING_STRATEGY}, ckpt_format=${CKPT_FORMAT}, wandb_project=${WANDB_PROJECT:-none}"
 
 torchrun "${DISTRIBUTED_ARGS[@]}" \
     "$PRETRAIN_SCRIPT_PATH" \
