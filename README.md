@@ -1,3 +1,205 @@
+Attention Residuals for Megatron-LM
+===================================
+
+This repository is **an implementation of Attention Residuals for
+Megatron-LM**, based on
+[`arXiv:2603.15031`](https://arxiv.org/abs/2603.15031).
+
+The method replaces fixed residual accumulation with a learned depth-wise
+attention over previous residual-producing hidden states. In this branch,
+self-attention and MLP are treated as separate residual-producing sublayers, and
+a final AttnRes aggregation is applied before the transformer's final layer
+norm.
+
+This repository is best read as a **reproduction and systems prototype**:
+
+- it implements **Full AttnRes** and **Block AttnRes**
+- it includes reference and optimized kernels
+- it was exercised on **dense Llama-3-style pretraining**
+- it is not a claim that every Megatron path is production-ready
+
+## Links
+
+- Paper:
+  [`arXiv:2603.15031`](https://arxiv.org/abs/2603.15031)
+- W&B report:
+  [`Report`](https://wandb.ai/tan3/attnres-repro/reports/An-Implementation-of-Attention-Residuals-in-Megatron-LM--VmlldzoxNjY4NjUwMQ)
+
+## Project Scope
+
+What this branch covers:
+
+- dense decoder-only **Llama-3-style** pretraining
+- **Full AttnRes** and **Block AttnRes**
+- Megatron-LM / Megatron Core integration
+- Transformer Engine **FP8** training path
+- experiments on **NVIDIA H100 NVL (96GB)** GPUs
+
+What this branch does not cover:
+
+- MoE models
+- cross-attention
+- pipeline parallelism
+- cross-stage caching
+- inference / KV-cache paths
+- exact reproduction of every large-scale systems feature discussed around the paper
+
+In other words: this is a careful reproduction of Attention Residuals in a
+**dense Llama-3-style Megatron pretraining setting**.
+
+## What We Implemented
+
+- **Full AttnRes**: attends over all previous residual-producing hidden states
+- **Block AttnRes**: compresses depth into learned block summaries
+- **Final AttnRes aggregation** at transformer block output
+- **Multiple implementations**:
+  - `torch`
+  - `checkpointed`
+  - `triton`
+  - `triton_bwd`
+- **Megatron integration** through config flags, transformer hooks, unit tests,
+  and runnable example scripts
+
+## Experimental Focus
+
+We ran two families of dense pretraining experiments:
+
+- **Llama-4B-style dense**
+  - `baseline`
+  - `attnres-full-checkpointed`
+  - `attnres-full-triton`
+  - `attnres-block`
+- **Llama-8B-style dense**
+  - `baseline`
+  - `attnres-full-triton`
+  - `attnres-block`
+
+Important naming note: "Llama-4B" in this branch means a **Llama-3-style dense
+scaling point at roughly 4B size** used for controlled experiments. It is not
+an official Meta release configuration.
+
+## Main Takeaways
+
+The current results point in a pretty clear direction:
+
+- **Attention Residuals can improve optimization behavior** relative to matched
+  dense baselines.
+- **Naive Full AttnRes is too expensive** to be the most meaningful practical
+  reference inside Megatron.
+- **Implementation matters a lot**: checkpointing and Triton kernels change the
+  cost profile substantially.
+- **Block AttnRes is the most practical scaling path** for longer contexts and
+  larger dense runs.
+
+These are development and reproduction results, not official Megatron
+benchmarks.
+
+## Quick Start
+
+Use Block AttnRes with the optimized Triton backward path for the first serious
+run:
+
+```bash
+--attention-residuals \
+--attention-residual-type block \
+--attention-residual-num-blocks 8 \
+--attention-residual-implementation triton_bwd
+```
+
+Example scripts live in [`examples/attention_residuals/`](examples/attention_residuals/).
+They assume you already have a tokenizer and a Megatron indexed dataset prefix.
+
+```bash
+export TOKENIZER_MODEL=/path/to/llama3-tokenizer
+export DATA_PREFIX=/path/to/megatron_text_document
+
+WANDB_PROJECT=attention-residuals \
+WANDB_EXP_NAME=block_n8_triton_bwd_1000steps \
+TOKENIZER_MODEL=$TOKENIZER_MODEL \
+DATA_PREFIX=$DATA_PREFIX \
+TRAIN_ITERS=1000 \
+LR_DECAY_ITERS=10000 \
+LR_WARMUP_ITERS=100 \
+ATTENTION_RESIDUAL_TYPE=block \
+ATTENTION_RESIDUAL_NUM_BLOCKS=8 \
+ATTENTION_RESIDUAL_IMPLEMENTATION=triton_bwd \
+./examples/attention_residuals/train_llama3_wikitext.sh attnres
+```
+
+For a fuller walkthrough, see
+[`examples/attention_residuals/README.md`](examples/attention_residuals/README.md).
+
+## Code Guide
+
+- Core module:
+  [`megatron/core/transformer/attention_residuals.py`](megatron/core/transformer/attention_residuals.py)
+- Config flags:
+  [`megatron/core/transformer/transformer_config.py`](megatron/core/transformer/transformer_config.py)
+- Transformer block integration:
+  [`megatron/core/transformer/transformer_block.py`](megatron/core/transformer/transformer_block.py)
+- Transformer layer integration:
+  [`megatron/core/transformer/transformer_layer.py`](megatron/core/transformer/transformer_layer.py)
+- Tests:
+  [`tests/unit_tests/transformer/test_attention_residuals.py`](tests/unit_tests/transformer/test_attention_residuals.py)
+- Feature documentation:
+  [`docs/user-guide/features/attention_residuals.md`](docs/user-guide/features/attention_residuals.md)
+- Reproduction launchers:
+  [`examples/attention_residuals/`](examples/attention_residuals/)
+
+## Paper Alignment
+
+The implementation is aligned with the paper's residual-producing-sublayer
+view:
+
+| Paper idea | This branch |
+| --- | --- |
+| Self-attention and MLP are separate residual-producing sublayers | implemented in `transformer_layer.py` |
+| Full AttnRes attends over all previous residual states | `ATTENTION_RESIDUAL_TYPE=full` |
+| Block AttnRes reduces depth candidates through block summaries | `ATTENTION_RESIDUAL_TYPE=block` |
+| Final layer output should also be AttnRes-produced | implemented as `final_attn_res` in `transformer_block.py` |
+| Full AttnRes overhead depends on retained activations | studied here under Megatron recomputation / FP8 / parallelism |
+
+One of the main practical findings is that the paper's clean algorithmic story
+meets a messier systems reality inside Megatron: selective recomputation,
+Transformer Engine FP8 kernels, and parallelism choices make naive Full AttnRes
+much more expensive than the paper-level description might suggest. That is why
+this branch includes both **checkpointed** and **Triton-backed** variants of
+Full AttnRes, plus **Block AttnRes** as the practical scaling path.
+
+## Reproduction Snapshot
+
+Representative development runs:
+
+| Setup | Mode | Approx. speed | Notes |
+| --- | --- | ---: | --- |
+| 4B: 16 layers, seq 1024, 2x H100 NVL | baseline | 1040 ms/iter | dense Llama-3-style FP8 run |
+| 4B: 16 layers, seq 1024, 2x H100 NVL | Full, checkpointed | 4315 ms/iter | memory-safe semantic reference |
+| 4B: 16 layers, seq 1024, 2x H100 NVL | Full, Triton forward | 3922 ms/iter | forward-only optimization |
+| 4B: 16 layers, seq 1024, 2x H100 NVL | Full, Triton forward/backward | 1690 ms/iter | usable optimized Full AttnRes |
+| 4B: 16 layers, seq 1024, 2x H100 NVL | Block, Triton forward/backward | 1360 ms/iter | practical tradeoff |
+
+A fuller experiment write-up is being organized in W&B. The README is designed
+to point to that report once the final runs are curated.
+
+## Code and Docs
+
+- Top-level feature guide:
+  [`docs/user-guide/features/attention_residuals.md`](docs/user-guide/features/attention_residuals.md)
+- Example launchers and notes:
+  [`examples/attention_residuals/`](examples/attention_residuals/)
+- Core implementation:
+  [`megatron/core/transformer/attention_residuals.py`](megatron/core/transformer/attention_residuals.py)
+- Tests:
+  [`tests/unit_tests/transformer/test_attention_residuals.py`](tests/unit_tests/transformer/test_attention_residuals.py)
+
+## Upstream Megatron-LM README
+
+The original Megatron-LM README is kept below for installation, upstream
+documentation, and general project context.
+
+<details>
+<summary>Show upstream README</summary>
+
 <div align="center">
 
 Megatron-LM and Megatron Core
@@ -160,3 +362,5 @@ If you use Megatron in your research or project, we appreciate that you use the 
   year={2019}
 }
 ```
+
+</details>
